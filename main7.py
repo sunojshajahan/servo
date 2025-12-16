@@ -1,0 +1,298 @@
+import cv2
+from ultralytics import YOLO
+import numpy as np
+import time
+import serial
+
+# =========================================================
+# PERFORMANCE / DEBUG
+# =========================================================
+DEBUG_SHOW = True            # False = быстрее (без imshow)
+DEBUG_DRAW = True            # False = быстрее (не рисовать боксы)
+PRINT_TARGET = False         # True = печатать TARGET в консоль (может тормозить)
+
+# Пропуск инференса: 1 = каждый кадр, 2 = через кадр, 3 = каждый третий...
+INFER_EVERY_N_FRAMES = 1
+
+# Отправка TARGET в Arduino: 1,2,3,4,5... можно любые
+SEND_EVERY_N_FRAMES = 10
+
+# Ограничить размер входа (очень влияет на FPS)
+CAPTURE_W = 960
+CAPTURE_H = 540
+
+# OpenCV threads (иногда помогает стабильности)
+cv2.setNumThreads(1)
+
+# =========================================================
+# MODEL / VIDEO
+# =========================================================
+MODEL_PATH = "runs/detect/train/weights/best.pt"
+VIDEO_SOURCE = "output.mp4"   # 0 — камера
+CONF = 0.5
+IOU = 0.5
+TRACKER_CFG = "bytetrack.yaml"
+
+# =========================================================
+# ROI / CENTER LINE
+# =========================================================
+ROI_HEIGHT_FRACTION = 0.4
+DIM_OUTSIDE = True
+DIM_ALPHA = 0.35
+
+LINE_TOL_PIX = None
+LINE_TOL_FRAC = 0.015
+
+# =========================================================
+# PAUSE
+# =========================================================
+PAUSE_MODE = "key"       # "key" или "time"
+TIME_PAUSE_SEC = 2.0
+
+# =========================================================
+# SERIAL
+# =========================================================
+SERIAL_ENABLED = True
+SERIAL_PORT = "/dev/ttyACM0"   # проверь ls /dev/ttyACM* /dev/ttyUSB*
+BAUD = 115200
+
+# =========================================================
+# TARGET LOGIC (движение снизу -> вверх)
+# =========================================================
+TARGET_MISSING_LIMIT = 10   # кадров, после которых сбрасываем "залипшую" цель
+
+
+def send_line(ser, msg: str):
+    if ser:
+        ser.write((msg.strip() + "\n").encode("utf-8"))
+
+
+def show_paused_frame(win, frame, mid_y, tol):
+    overlay = frame.copy()
+    dark = np.zeros_like(overlay)
+    overlay = cv2.addWeighted(dark, 0.35, overlay, 0.65, 0)
+
+    text = "PAUSED - press SPACE" if PAUSE_MODE == "key" else f"PAUSED {TIME_PAUSE_SEC:.1f}s"
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)
+    x = (overlay.shape[1] - tw) // 2
+    y = (overlay.shape[0] // 2) - 10
+    cv2.rectangle(overlay, (x - 14, y - th - 14), (x + tw + 14, y + 14), (0, 0, 0), -1)
+    cv2.putText(overlay, text, (x, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
+
+    cv2.line(overlay, (0, mid_y), (overlay.shape[1], mid_y), (0, 255, 255), 2)
+    cv2.rectangle(overlay, (0, mid_y - tol), (overlay.shape[1], mid_y + tol), (0, 255, 255), 1)
+
+    cv2.imshow(win, overlay)
+
+
+def main():
+    model = YOLO(MODEL_PATH)
+    # model.fuse()  # иногда помогает, можно включить
+
+    cap = cv2.VideoCapture(VIDEO_SOURCE)
+    if not cap.isOpened():
+        raise RuntimeError("Не удалось открыть видео/камеру")
+
+    # Ограничим размер (для камеры работает лучше, для видео зависит от кодека)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAPTURE_W)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_H)
+
+    ser = None
+    if SERIAL_ENABLED:
+        ser = serial.Serial(SERIAL_PORT, BAUD, timeout=0.01)
+        time.sleep(2.0)  # Arduino reset after opening serial
+
+    print("ESC = exit | SPACE = continue (pause)")
+
+    handled_ids = set()
+    current_target_id = None
+    target_missing_frames = 0
+    frame_idx = 0
+    sent_size = False
+
+    # Для ускорения: если пропускаем инференс, используем last_results
+    last_results = None
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame_idx += 1
+        h, w = frame.shape[:2]
+
+        # отправка размера один раз
+        if SERIAL_ENABLED and not sent_size:
+            send_line(ser, f"SIZE,{w},{h}")
+            sent_size = True
+
+        tol = LINE_TOL_PIX if LINE_TOL_PIX is not None else max(2, int(h * LINE_TOL_FRAC))
+
+        # --- ROI ---
+        roi_h = int(h * ROI_HEIGHT_FRACTION)
+        y1 = (h - roi_h) // 2
+        y2 = y1 + roi_h
+        roi = frame[y1:y2, :]
+
+        # --- inference/track ---
+        if (frame_idx % INFER_EVERY_N_FRAMES) == 0:
+            last_results = model.track(
+                roi,
+                conf=CONF,
+                iou=IOU,
+                persist=True,
+                tracker=TRACKER_CFG,
+                verbose=False
+            )
+        results = last_results
+
+        # --- visualization base ---
+        output = frame.copy()
+        if DEBUG_SHOW:
+            if DIM_OUTSIDE:
+                dark = np.zeros_like(output)
+                output = cv2.addWeighted(dark, DIM_ALPHA, output, 1 - DIM_ALPHA, 0)
+                output[y1:y2, :] = frame[y1:y2, :]
+
+        mid_y = (y1 + y2) // 2
+
+        if DEBUG_SHOW and DEBUG_DRAW:
+            cv2.rectangle(output, (0, y1), (w, y2), (0, 255, 0), 2)
+            cv2.line(output, (0, mid_y), (w, mid_y), (0, 255, 255), 2)
+            cv2.rectangle(output, (0, mid_y - tol), (w, mid_y + tol), (0, 255, 255), 1)
+
+        trigger_ids = []
+        target_found = False
+        target_bbox = None
+        target_cxcy = None
+
+        closest_dist = None
+        closest_data = None  # (id, cx, cy, BX1,BY1,BX2,BY2)
+
+        if results and len(results) > 0 and results[0].boxes is not None:
+            boxes = results[0].boxes
+            ids = boxes.id
+            xyxy = boxes.xyxy
+
+            if ids is not None and xyxy is not None:
+                ids = ids.cpu().numpy().astype(int)
+                xyxy = xyxy.cpu().numpy().astype(int)
+
+                for i, (bx1, by1, bx2, by2) in enumerate(xyxy):
+                    track_id = ids[i]
+
+                    # ROI -> frame coords
+                    BX1, BX2 = int(bx1), int(bx2)
+                    BY1, BY2 = int(by1 + y1), int(by2 + y1)
+                    cx = (BX1 + BX2) // 2
+                    cy = (BY1 + BY2) // 2
+
+                    if DEBUG_SHOW and DEBUG_DRAW:
+                        cv2.rectangle(output, (BX1, BY1), (BX2, BY2), (255, 0, 0), 2)
+                        cv2.putText(output, f"ID:{track_id}", (BX1, max(20, BY1 - 6)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+                    if track_id in handled_ids:
+                        continue
+
+                    # TRIGGER: пересёк линию
+                    if abs(cy - mid_y) <= tol:
+                        trigger_ids.append(track_id)
+
+                    dist = abs(cy - mid_y)
+
+                    # --- TARGET logic ---
+                    if current_target_id is not None:
+                        if track_id == current_target_id:
+                            target_found = True
+                            target_bbox = (BX1, BY1, BX2, BY2)
+                            target_cxcy = (cx, cy)
+                    else:
+                        # движение снизу->вверх: берём кандидатов ТОЛЬКО снизу (cy >= mid_y)
+                        if cy < mid_y:
+                            continue
+
+                        if closest_dist is None or dist < closest_dist:
+                            closest_dist = dist
+                            closest_data = (track_id, cx, cy, BX1, BY1, BX2, BY2)
+
+        # Назначаем цель, если её нет
+        if current_target_id is None and closest_data is not None:
+            current_target_id = closest_data[0]
+            target_found = True
+            target_cxcy = (closest_data[1], closest_data[2])
+            target_bbox = (closest_data[3], closest_data[4], closest_data[5], closest_data[6])
+
+        # Анти-залипание
+        if current_target_id is not None:
+            if not target_found:
+                target_missing_frames += 1
+                if target_missing_frames >= TARGET_MISSING_LIMIT:
+                    current_target_id = None
+                    target_missing_frames = 0
+            else:
+                target_missing_frames = 0
+
+        # Выделить цель
+        if DEBUG_SHOW and DEBUG_DRAW and current_target_id and target_bbox:
+            BX1, BY1, BX2, BY2 = target_bbox
+            cv2.rectangle(output, (BX1, BY1), (BX2, BY2), (0, 0, 255), 3)
+            cv2.putText(output, f"TARGET:{current_target_id}", (BX1, max(25, BY1 - 20)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+        # Отправка TARGET в Arduino
+        if SERIAL_ENABLED and current_target_id and target_found:
+            if frame_idx % SEND_EVERY_N_FRAMES == 0:
+                cx, cy = target_cxcy
+                send_line(ser, f"TARGET,{current_target_id},{cx},{cy}")
+                if PRINT_TARGET:
+                    print(f"[TARGET] ID={current_target_id} center=({cx},{cy})")
+
+        # Отправка FIRE при пересечении цели
+        if trigger_ids:
+            handled_ids.update(trigger_ids)
+
+            if current_target_id in trigger_ids:
+                send_line(ser, f"FIRE,{current_target_id}")
+                current_target_id = None
+                target_missing_frames = 0
+
+            # pause
+            if DEBUG_SHOW:
+                if PAUSE_MODE == "key":
+                    while True:
+                        show_paused_frame("Weed tracking (final)", output, mid_y, tol)
+                        k = cv2.waitKey(30) & 0xFF
+                        if k == 27:
+                            cap.release()
+                            cv2.destroyAllWindows()
+                            if ser: ser.close()
+                            return
+                        if k == 32:
+                            break
+                else:
+                    t0 = time.time()
+                    while time.time() - t0 < TIME_PAUSE_SEC:
+                        show_paused_frame("Weed tracking (final)", output, mid_y, tol)
+                        if cv2.waitKey(30) & 0xFF == 27:
+                            cap.release()
+                            cv2.destroyAllWindows()
+                            if ser: ser.close()
+                            return
+
+        # show
+        if DEBUG_SHOW:
+            cv2.imshow("Weed tracking (final)", output)
+            if cv2.waitKey(1) & 0xFF == 27:
+                break
+
+    cap.release()
+    if DEBUG_SHOW:
+        cv2.destroyAllWindows()
+    if ser:
+        ser.close()
+
+
+if __name__ == "__main__":
+    main()
